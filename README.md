@@ -1,4 +1,4 @@
-# Hermes-Memory
+# CodeBuddy
 
 CodeBuddy 工作项目的代码管理平台：一个 CLI（`hmp`）加一套目录规范，用来登记、跟踪、归档通过 CodeBuddy 推进的项目。
 
