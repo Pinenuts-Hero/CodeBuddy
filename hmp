@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""hmp 可执行入口：./hmp。实现位于 _hmp 包。"""
+
+from _hmp.cli import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())
