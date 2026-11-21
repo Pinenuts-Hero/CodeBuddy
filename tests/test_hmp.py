@@ -3,6 +3,8 @@
 全部使用临时本地 Git 仓库与临时工作区，不访问网络。
 """
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -14,7 +16,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from _hmp import core  # noqa: E402
+from _hmp import cli, core  # noqa: E402
 
 
 class HmpTestCase(unittest.TestCase):
@@ -23,6 +25,43 @@ class HmpTestCase(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.base = tmp.name
         self.workspace = os.path.join(self.base, "ws")
+
+        # 隔离用户配置：HOME 指向临时目录，避免读写真实的 ~/.config/hmp。
+        self.home = os.path.join(self.base, "home")
+        os.makedirs(self.home)
+        self._saved_env = {key: os.environ.get(key) for key in ("HOME", "HMP_WORKSPACE")}
+        os.environ["HOME"] = self.home
+        os.environ.pop("HMP_WORKSPACE", None)
+        self.addCleanup(self._restore_env)
+        self.addCleanup(self._restore_cwd, os.getcwd())
+
+    def _restore_env(self):
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    @staticmethod
+    def _restore_cwd(cwd):
+        os.chdir(cwd)
+
+    def _chdir(self, path):
+        os.chdir(path)
+
+    def _config(self):
+        with open(core.config_file(), encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def _remembered(self):
+        return self._config().get("workspace")
+
+    @staticmethod
+    def _run_cli(argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
 
     # ------------------------------------------------------------------ #
     # 辅助
@@ -207,6 +246,111 @@ class HmpTestCase(unittest.TestCase):
         result2 = core.remove_project(self.workspace, "demo2", delete=True)
         self.assertTrue(result2["deleted"])
         self.assertFalse(os.path.exists(target2))
+
+    # ------------------------------------------------------------------ #
+    # 工作区记忆（用户级配置）
+    # ------------------------------------------------------------------ #
+    def test_init_remembers_workspace_for_next_commands(self):
+        code, out, _ = self._run_cli(["init", self.workspace])
+        self.assertEqual(code, 0)
+        self.assertIn("已记住", out)
+
+        self.assertEqual(self._remembered(), os.path.abspath(self.workspace))
+        self.assertTrue(
+            core.config_file().startswith(os.path.join(self.home, ".config")),
+            core.config_file(),
+        )
+
+        # 换到无关目录，不带 -w、不设环境变量，也能定位到工作区
+        self._chdir(self.base)
+        self.assertEqual(core.find_workspace(), os.path.abspath(self.workspace))
+        code, out, _ = self._run_cli(["list"])
+        self.assertEqual(code, 0)
+        self.assertIn("还没有已登记的项目", out)
+
+    def test_explicit_workspace_overrides_remembered(self):
+        self._run_cli(["init", self.workspace])
+        other = os.path.join(self.base, "other")
+        core.init_workspace(other)
+        self._chdir(self.base)
+
+        self.assertEqual(core.find_workspace(other), os.path.abspath(other))
+        code, _, _ = self._run_cli(["-w", other, "list"])
+        self.assertEqual(code, 0)
+        # 仅临时覆盖，记住的值不变
+        self.assertEqual(self._remembered(), os.path.abspath(self.workspace))
+
+    def test_env_overrides_remembered_workspace(self):
+        self._run_cli(["init", self.workspace])
+        other = os.path.join(self.base, "other")
+        core.init_workspace(other)
+        self._chdir(self.base)
+
+        os.environ["HMP_WORKSPACE"] = other
+        self.assertEqual(core.find_workspace(), os.path.abspath(other))
+        code, _, _ = self._run_cli(["list"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self._remembered(), os.path.abspath(self.workspace))
+
+    def test_upward_search_precedes_remembered_workspace(self):
+        self._run_cli(["init", self.workspace])
+        other = os.path.join(self.base, "other")
+        core.init_workspace(other)
+        nested = os.path.join(other, "projects", "nested")
+        os.makedirs(nested)
+
+        self._chdir(nested)
+        self.assertEqual(core.find_workspace(), os.path.abspath(other))
+
+    def test_use_switches_and_remembers_workspace(self):
+        self._run_cli(["init", self.workspace])
+        other = os.path.join(self.base, "other")
+        core.init_workspace(other)
+
+        code, out, _ = self._run_cli(["use", other])
+        self.assertEqual(code, 0)
+        self.assertIn(os.path.abspath(other), out)
+        self.assertEqual(self._remembered(), os.path.abspath(other))
+
+        self._chdir(self.base)
+        self.assertEqual(core.find_workspace(), os.path.abspath(other))
+
+    def test_use_rejects_non_workspace(self):
+        missing = os.path.join(self.base, "not-a-workspace")
+        os.makedirs(missing)
+        code, _, err = self._run_cli(["use", missing])
+        self.assertEqual(code, 1)
+        self.assertIn("hmp init", err)
+        self.assertFalse(os.path.exists(core.config_file()))
+
+    def test_missing_workspace_error_mentions_init_and_use(self):
+        self._chdir(self.base)
+        with self.assertRaises(core.HmpError) as ctx:
+            core.find_workspace()
+        message = str(ctx.exception)
+        self.assertIn("hmp init", message)
+        self.assertIn("hmp use", message)
+
+    def test_stale_remembered_workspace_is_reported(self):
+        self._run_cli(["init", self.workspace])
+        os.remove(core.registry_file(self.workspace))
+        self._chdir(self.base)
+
+        with self.assertRaises(core.HmpError) as ctx:
+            core.find_workspace()
+        message = str(ctx.exception)
+        self.assertIn("记住的工作区已失效", message)
+        self.assertIn("hmp use", message)
+
+    def test_corrupt_config_is_treated_as_empty(self):
+        path = core.config_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertIsNone(core.remembered_workspace())
+
+        self._run_cli(["init", self.workspace])
+        self.assertEqual(self._remembered(), os.path.abspath(self.workspace))
 
     # ------------------------------------------------------------------ #
     # 入口
