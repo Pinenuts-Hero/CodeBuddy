@@ -41,11 +41,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-w",
         "--workspace",
-        help="工作区目录；默认从当前目录向上查找 registry.json，或使用 HMP_WORKSPACE",
+        help="工作区目录；默认依次使用 HMP_WORKSPACE、当前目录向上查找的 registry.json、"
+        "用户配置中记住的工作区",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("init", help="创建工作区").add_argument("dir", help="工作区目录")
+    sub.add_parser("init", help="创建工作区并记住它").add_argument("dir", help="工作区目录")
+    sub.add_parser("use", help="切换并记住当前工作区").add_argument("dir", help="已有工作区目录")
     add = sub.add_parser("add", help="登记项目并克隆仓库")
     add.add_argument("name", help="项目名称")
     add.add_argument("git_url", help="Git 仓库地址")
@@ -102,7 +104,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "init":
             root, created = core.init_workspace(args.dir)
+            core.remember_workspace(root)
             print(f"工作区已{'创建' if created else '存在'}：{root}")
+            print("已记住该工作区，后续命令可直接运行。")
+            return 0
+
+        if args.command == "use":
+            root = core.use_workspace(args.dir)
+            print(f"已切换到工作区：{root}")
             return 0
 
         root = core.find_workspace(args.workspace)
