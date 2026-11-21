@@ -41,6 +41,52 @@ def registry_file(root: str) -> str:
     return os.path.join(root, "registry.json")
 
 
+def config_file() -> str:
+    """用户级配置文件路径：``~/.config/hmp/config.json``。"""
+    return os.path.join(os.path.expanduser("~"), ".config", "hmp", "config.json")
+
+
+def load_config() -> dict:
+    """读取用户级配置；文件缺失或损坏时按空配置处理。"""
+    try:
+        with open(config_file(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(data: dict) -> None:
+    """原子写入用户级配置，必要时创建 ``~/.config/hmp``。"""
+    path = config_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        raise HmpError(f"无法写入用户配置 {path}：{exc}") from exc
+
+
+def remembered_workspace() -> str | None:
+    """返回用户配置中记住的工作区绝对路径；未记住时返回 None。"""
+    value = load_config().get("workspace")
+    if isinstance(value, str) and value.strip():
+        return os.path.abspath(os.path.expanduser(value))
+    return None
+
+
+def remember_workspace(root: str) -> str:
+    """把工作区路径写入用户配置，返回规范化后的绝对路径。"""
+    root = os.path.abspath(os.path.expanduser(root))
+    data = load_config()
+    data["workspace"] = root
+    save_config(data)
+    return root
+
+
 def _empty_registry() -> dict:
     return {"version": VERSION, "projects": {}}
 
@@ -70,26 +116,46 @@ def load_registry(root: str) -> dict:
     return data
 
 
+def _search_upwards() -> str | None:
+    """从当前目录向上查找含 registry.json 的目录。"""
+    cur = os.getcwd()
+    while True:
+        if os.path.isfile(registry_file(cur)):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+
 def find_workspace(explicit: str | None = None) -> str:
-    """定位工作区：命令行参数 > 环境变量 > 从当前目录向上查找 registry.json。"""
+    """定位工作区。
+
+    优先级：命令行参数 > 环境变量 > 当前目录向上查找 > 用户配置中记住的工作区。
+    """
+    from_config = False
     if explicit:
         root = os.path.abspath(os.path.expanduser(explicit))
     elif os.environ.get(WORKSPACE_ENV):
         root = os.path.abspath(os.path.expanduser(os.environ[WORKSPACE_ENV]))
     else:
-        cur = os.getcwd()
-        while True:
-            if os.path.isfile(registry_file(cur)):
-                root = cur
-                break
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                raise HmpError(
-                    "未找到工作区：请在 hmp 工作区内运行，使用 -w 指定目录，"
-                    f"或设置 {WORKSPACE_ENV} 环境变量"
-                )
-            cur = parent
+        root = _search_upwards()
+        if root is None:
+            root = remembered_workspace()
+            from_config = True
+
+    if root is None:
+        raise HmpError(
+            "未找到工作区：请先运行 hmp init <dir> 创建工作区，"
+            "或用 hmp use <dir> 指定已有工作区；也可使用 -w 或设置 "
+            f"{WORKSPACE_ENV} 环境变量"
+        )
     if not os.path.isfile(registry_file(root)):
+        if from_config:
+            raise HmpError(
+                f"记住的工作区已失效（缺少 registry.json）：{root}；"
+                "可用 hmp use <dir> 重新指定，或运行 hmp init <dir>"
+            )
         raise HmpError(f"不是有效的 hmp 工作区（缺少 registry.json）：{root}")
     return root
 
@@ -159,6 +225,17 @@ def init_workspace(target: str) -> tuple[str, bool]:
     if created:
         _write_registry(root, _empty_registry())
     return root, created
+
+
+def use_workspace(target: str) -> str:
+    """切换到指定工作区并写入用户配置，返回其绝对路径。"""
+    root = os.path.abspath(os.path.expanduser(target))
+    if not os.path.isfile(registry_file(root)):
+        raise HmpError(
+            f"不是有效的 hmp 工作区（缺少 registry.json）：{root}；"
+            "可先运行 hmp init <dir> 创建"
+        )
+    return remember_workspace(root)
 
 
 def add_project(root: str, name: str, url: str) -> dict:
